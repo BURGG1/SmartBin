@@ -65,16 +65,16 @@ app.use((req, res) => {
 
 app.use(errorHandler);
 
-// Run auto-schedule every 30 seconds
+// Run auto-schedule every 30 seconds (edit this if the auto-schedule interval needs to be changed)
 setInterval(async () => {
-  try {
-    await checkAndAutoSchedule();
-  } catch (err) {
-    console.error("[AutoSchedule] Error:", err.message);
-  }
-}, 30000);
+    try {
+        await checkAndAutoSchedule();
+    } catch (err) {
+        console.error("[AutoSchedule] Polling error:", err.message);
+    }
+}, 30_000);
 
-// Also run once on startup
+// Run once on startup
 checkAndAutoSchedule().catch(console.error);
 
 app.listen(PORT, "0.0.0.0", () => {
