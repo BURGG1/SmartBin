@@ -4,6 +4,7 @@ import NavigationShell from "../../navigation/mainNav";
 import Footer from "../../components/Footer";
 import BASE_URL from "../../config";
 import Pagination from "../../components/Pagination";
+import useDebounce from "../../hooks/useDebounce";
 
 import {
     CheckCircle,
@@ -82,8 +83,11 @@ export default function WasteBin() {
 
     // Table
     const [binsData, setBinsData] = useState([]);
+    const [binsTotal, setBinsTotal] = useState(0);
     const [loading, setLoading] = useState(true);
+    const [binsError, setBinsError] = useState("");
     const [search, setSearch] = useState("");
+    const debouncedSearch = useDebounce(search, 400);
     const [filter, setFilter] = useState("all");
 
     // Inline edit
@@ -92,33 +96,59 @@ export default function WasteBin() {
     const [editedLocation, setEditedLocation] = useState("");
     const [saving, setSaving] = useState(false);
 
-    // ── Pagination ──
+    // ── Pagination (server-side) ──
     const [binPage, setBinPage] = useState(1);
 
     useEffect(() => {
-        fetchBins();
         fetchDevices();
     }, []);
 
-    // Reset to page 1 whenever the search or filter changes
-    useEffect(() => {
-        setBinPage(1);
-    }, [search, filter]);
-
-    async function fetchBins() {
+    async function fetchBins(signal) {
         setLoading(true);
+        setBinsError("");
         try {
-            const res = await fetch(API);
+            const params = new URLSearchParams({
+                search: debouncedSearch,
+                type: filter === "all" ? "" : filter,
+                page: binPage,
+                limit: BINS_PER_PAGE,
+            });
+            const res = await fetch(`${API}?${params}`, { signal });
             const data = await res.json();
             if (data.success) {
                 setBinsData(data.data.map(normaliseBin));
+                // Backend must return `total` = count of ALL bins matching
+                // the search/type filter, not just this page's length.
+                setBinsTotal(data.total ?? data.data.length);
+            } else {
+                setBinsError("Failed to load bins.");
             }
         } catch (err) {
+            if (err.name === "AbortError") return;
             console.error("Failed to fetch bins:", err);
+            setBinsError("Failed to load bins. Is the server running?");
         } finally {
             setLoading(false);
         }
     }
+
+    useEffect(() => {
+        const controller = new AbortController();
+        fetchBins(controller.signal);
+        return () => controller.abort();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [debouncedSearch, filter, binPage]);
+
+    // Reset to page 1 whenever the search or filter changes
+    useEffect(() => {
+        setBinPage(1);
+    }, [debouncedSearch, filter]);
+
+    // If the total shrinks below the current page, step back.
+    useEffect(() => {
+        const totalPages = Math.max(1, Math.ceil(binsTotal / BINS_PER_PAGE));
+        if (binPage > totalPages) setBinPage(totalPages);
+    }, [binsTotal, binPage]);
 
     async function fetchDevices() {
         try {
@@ -184,7 +214,6 @@ export default function WasteBin() {
             const data = await res.json();
 
             if (data.success) {
-                setBinsData((prev) => [...prev, normaliseBin(data.data)]);
                 setBinName("");
                 setCategory("");
                 setCapacity("");
@@ -192,6 +221,7 @@ export default function WasteBin() {
                 setDeviceId("");
                 setPendingBin(null);
                 fetchDevices(); // refresh so the just-assigned device drops out of the list
+                fetchBins(); // re-pull from the server instead of hand-patching local state
             } else {
                 setAddError(data.message || "Failed to add bin.");
             }
@@ -220,13 +250,8 @@ export default function WasteBin() {
             const data = await res.json();
 
             if (data.success) {
-                setBinsData((prev) =>
-                    prev.map((b) =>
-                        b._id === item._id ? { ...b, location: editedLocation } : b
-                    )
-                );
                 setEditingId(null);
-                setOpenConModal(true);
+                fetchBins(); // reflect the server's actual saved value
             }
         } catch (err) {
             console.error("Save failed:", err);
@@ -241,7 +266,7 @@ export default function WasteBin() {
             const res = await fetch(`${API}/${item._id}`, { method: "DELETE" });
             const data = await res.json();
             if (data.success) {
-                setBinsData((prev) => prev.filter((b) => b._id !== item._id));
+                fetchBins();
             }
         } catch (err) {
             console.error("Delete failed:", err);
@@ -252,28 +277,7 @@ export default function WasteBin() {
         if (editingId && inputRef.current) inputRef.current.focus();
     }, [editingId]);
 
-    const filteredData = binsData.filter((h) => {
-        const matchSearch =
-            h.type.toLowerCase().includes(search.toLowerCase()) ||
-            h.id.toLowerCase().includes(search.toLowerCase());
-        const matchFilter = filter === "all" || h.type === filter;
-        return matchSearch && matchFilter;
-    });
-
-    // Keep the current page valid whenever the filtered list changes
-    useEffect(() => {
-        const totalPages = Math.max(1, Math.ceil(filteredData.length / BINS_PER_PAGE));
-        if (binPage > totalPages) setBinPage(totalPages);
-    }, [filteredData.length, binPage]);
-
-    const paginatedData = filteredData.slice(
-        (binPage - 1) * BINS_PER_PAGE,
-        binPage * BINS_PER_PAGE
-    );
-    // Placeholder row count so the table keeps a constant height at
-    // BINS_PER_PAGE rows, regardless of how many bins land on the current
-    // page.
-    const binEmptyRows = Math.max(0, BINS_PER_PAGE - paginatedData.length);
+    const binEmptyRows = Math.max(0, BINS_PER_PAGE - binsData.length);
 
     return (
         <div className="flex-1">
@@ -437,7 +441,17 @@ export default function WasteBin() {
                         <div className="overflow-x-auto">
                             {loading ? (
                                 <p className="text-center text-gray-400 py-8">Loading bins...</p>
-                            ) : filteredData.length === 0 ? (
+                            ) : binsError ? (
+                                <div className="text-center py-8">
+                                    <p className="text-red-500 mb-2">{binsError}</p>
+                                    <button
+                                        onClick={() => fetchBins()}
+                                        className="text-sm text-gray-600 underline cursor-pointer"
+                                    >
+                                        Retry
+                                    </button>
+                                </div>
+                            ) : binsData.length === 0 ? (
                                 <p className="text-center text-gray-400 py-8">No bins found.</p>
                             ) : (
                                 <table className="w-full min-w-[800px]">
@@ -452,7 +466,7 @@ export default function WasteBin() {
                                         </tr>
                                     </thead>
                                     <tbody>
-                                        {paginatedData.map((item) => (
+                                        {binsData.map((item) => (
                                             <tr key={item._id} className="hover:bg-gray-50 text-sm md:text-[16px]">
                                                 <td className="px-4 py-3">{item.id}</td>
                                                 <td className="px-4 py-3 font-medium">{item.name}</td>
@@ -495,8 +509,6 @@ export default function WasteBin() {
                                                 </td>
                                             </tr>
                                         ))}
-                                        {/* Pad remaining slots so the table height stays
-                                            constant at BINS_PER_PAGE rows. */}
                                         {Array.from({ length: binEmptyRows }).map((_, i) => (
                                             <tr key={`bin-empty-${i}`} aria-hidden="true">
                                                 <td className="px-4 py-3" colSpan={6}>&nbsp;</td>
@@ -507,10 +519,10 @@ export default function WasteBin() {
                             )}
                         </div>
 
-                        {!loading && (
+                        {!loading && !binsError && (
                             <Pagination
                                 currentPage={binPage}
-                                totalItems={filteredData.length}
+                                totalItems={binsTotal}
                                 itemsPerPage={BINS_PER_PAGE}
                                 onPageChange={setBinPage}
                             />
@@ -518,6 +530,9 @@ export default function WasteBin() {
                     </section>
 
                     {/* ── Counter Section ───────────────────────────────────── */}
+                    {/* Reuses the same paginated `binsData` as the table above —
+                        rendering every bin here unbounded was the same
+                        real-world scaling problem the table had. */}
                     <section className="bg-white rounded-xl p-6 shadow">
                         <h2 className="text-lg md:text-xl font-bold text-gray-900">
                             Counter Information

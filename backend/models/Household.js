@@ -36,6 +36,12 @@ const householdSchema = new mongoose.Schema(
       lastMonthlyAward: { type: Date, default: null },     // last monthly award date
       awardedStreaks: [{ type: Number }],                  // streakDays already awarded (e.g. [10, 30])
     },
+
+    // ── Password reset fields (new) ──────────────────
+    resetPasswordCodeHash: { type: String, default: null },
+    resetPasswordExpires: { type: Date, default: null },
+    resetPasswordAttempts: { type: Number, default: 0 },
+    resetPasswordLockedUntil: { type: Date, default: null },
   },
   { timestamps: true }
 );

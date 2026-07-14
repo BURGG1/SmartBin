@@ -23,6 +23,12 @@ const adminSchema = new mongoose.Schema(
       type: Boolean,
       default: true,
     },
+
+    // --- Password reset fields (new) ---
+    resetPasswordCodeHash: { type: String, default: null },
+    resetPasswordExpires: { type: Date, default: null },
+    resetPasswordAttempts: { type: Number, default: 0 },
+    resetPasswordLockedUntil: { type: Date, default: null },
   },
   { timestamps: true }
 );
