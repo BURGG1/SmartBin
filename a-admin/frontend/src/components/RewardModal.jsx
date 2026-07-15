@@ -1,48 +1,78 @@
 import { X, Calendar } from "lucide-react";
-import { useState } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import Pagination from "./Pagination";
+import BASE_URL from "../config";
 
 const REWARD_LIMIT = 7;
-
-const rewardLogs = [
-    { id: 1, date: "2026-02-18", rewardName: "Free Clinical Checkup", householdId: "HH-202610001", householdName: "Joel Dela Cruz", stockUpdate: -1 },
-    { id: 2, date: "2026-02-18", rewardName: "Vitamins/Medicine", householdId: "HH-202610002", householdName: "Martin Lopez", stockUpdate: -1 },
-    { id: 3, date: "2026-02-17", rewardName: "Free Clinical Checkup", householdId: "HH-202610003", householdName: "Ramon Reyes", stockUpdate: -1 },
-    { id: 4, date: "2026-02-16", rewardName: "50% off to Barangay Clearance", householdId: "HH-202610004", householdName: "Remedio Delo Santos", stockUpdate: -1 },
-    { id: 5, date: "2026-02-15", rewardName: "50% off to Business Permit", householdId: "HH-202610005", householdName: "Cecilia Garcia", stockUpdate: -1 },
-    { id: 6, date: "2026-02-14", rewardName: "50% off to Business Permit", householdId: "HH-202610006", householdName: "Rolando Martinez", stockUpdate: -1 },
-    { id: 7, date: "2026-02-13", rewardName: "50% off to Barangay Clearance", householdId: "HH-202610007", householdName: "Rolando Martinez", stockUpdate: -1 },
-    { id: 8, date: "2026-02-12", rewardName: "Vitamins/Medicine", householdId: "HH-202610008", householdName: "Joel Dela Cruz", stockUpdate: -1 },
-];
 
 export function ViewRewardModal({ isOpen, onClose, rName }) {
     const [fromDate, setFromDate] = useState("");
     const [toDate, setToDate]     = useState("");
     const [page, setPage]         = useState(1);
+    const [logs, setLogs]         = useState([]);
+    const [total, setTotal]       = useState(0);
+    const [loading, setLoading]   = useState(false);
+    const [error, setError]       = useState("");
+
+    const abortRef = useRef(null);
+
+    // ── Fetch a single page of reward redemption logs from the server ────────
+    const fetchLogs = useCallback(async (pageArg = 1) => {
+        abortRef.current?.abort();
+        const controller = new AbortController();
+        abortRef.current = controller;
+
+        setLoading(true);
+        setError("");
+        try {
+            const params = new URLSearchParams({
+                page: pageArg,
+                limit: REWARD_LIMIT,
+                ...(rName    && { rewardName: rName }),
+                ...(fromDate && { from: fromDate }),
+                ...(toDate   && { to: toDate }),
+            });
+
+            // NOTE: adjust this endpoint path to match your actual backend route
+            const res  = await fetch(`${BASE_URL}/api/rewards/logs?${params}`, { signal: controller.signal });
+            const data = await res.json();
+
+            if (data.success) {
+                setLogs(data.data);
+                setTotal(data.pagination?.total ?? data.data.length);
+                setPage(pageArg);
+            } else {
+                setError("Failed to load reward history.");
+            }
+        } catch (err) {
+            if (err.name !== "AbortError") setError("Network error. Could not load reward history.");
+        } finally {
+            if (abortRef.current === controller) setLoading(false);
+        }
+    }, [rName, fromDate, toDate]);
+
+    // Reset filters and load page 1 whenever the modal opens (or the reward changes)
+    useEffect(() => {
+        if (!isOpen) return;
+        setFromDate("");
+        setToDate("");
+        fetchLogs(1);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [isOpen, rName]);
+
+    // Re-fetch page 1 whenever the date filter changes
+    useEffect(() => {
+        if (!isOpen) return;
+        fetchLogs(1);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [fromDate, toDate]);
+
+    // Cancel any pending request on unmount
+    useEffect(() => () => abortRef.current?.abort(), []);
 
     if (!isOpen) return null;
 
-    const filteredLogs = rewardLogs.filter((log) => {
-        const matchesReward = !rName || log.rewardName === rName;
-
-        const logDate = new Date(log.date);
-        const matchesDate =
-            (!fromDate || logDate >= new Date(fromDate)) &&
-            (!toDate || logDate <= new Date(toDate));
-
-        return matchesReward && matchesDate;
-    });
-
-    const paginatedLogs = filteredLogs.slice(
-        (page - 1) * REWARD_LIMIT,
-        page * REWARD_LIMIT
-    );
-    const emptyRows = Math.max(0, REWARD_LIMIT - paginatedLogs.length);
-
-    const handleDateChange = (value) => {
-        setFromDate(value);
-        setPage(1);
-    };
+    const emptyRows = Math.max(0, REWARD_LIMIT - logs.length);
 
     return (
         <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4">
@@ -64,7 +94,7 @@ export function ViewRewardModal({ isOpen, onClose, rName }) {
                         <input
                             type="date"
                             value={fromDate}
-                            onChange={(e) => handleDateChange(e.target.value)}
+                            onChange={(e) => setFromDate(e.target.value)}
                             className="border rounded-lg px-3 py-2 text-sm w-50"
                         />
                     </div>
@@ -73,52 +103,62 @@ export function ViewRewardModal({ isOpen, onClose, rName }) {
                 {/* TABLE */}
                 <div className="px-2">
                     <div className="overflow-x-auto">
-                        <table className="w-full text-sm">
-                            <thead className="bg-gray-100 sticky top-0">
-                                <tr>
-                                    <th className="py-3">Date</th>
-                                    <th>Reward Name</th>
-                                    <th>Household ID</th>
-                                    <th>Resident</th>
-                                    <th className="px-4">Stock</th>
-                                </tr>
-                            </thead>
-
-                            <tbody className="text-center">
-                                {paginatedLogs.length === 0 ? (
+                        {loading ? (
+                            <p className="text-center py-6 text-gray-400">Loading reward history...</p>
+                        ) : error ? (
+                            <p className="text-center py-6 text-red-500">{error}</p>
+                        ) : (
+                            <table className="w-full text-sm">
+                                <thead className="bg-gray-100 sticky top-0">
                                     <tr>
-                                        <td colSpan="5" className="text-center py-6 text-gray-500">
-                                            No records found for selected dates
-                                        </td>
+                                        <th className="py-3">Date</th>
+                                        <th>Reward Name</th>
+                                        <th>Household ID</th>
+                                        <th>Resident</th>
+                                        <th className="px-4">Stock</th>
                                     </tr>
-                                ) : (
-                                    paginatedLogs.map((log) => (
-                                        <tr key={log.id}>
-                                            <td className="py-3 font-medium">{log.date}</td>
-                                            <td>{log.rewardName}</td>
-                                            <td>{log.householdId}</td>
-                                            <td>{log.householdName}</td>
-                                            <td className="text-red-500">{log.stockUpdate}</td>
+                                </thead>
+
+                                <tbody className="text-center">
+                                    {logs.length === 0 ? (
+                                        <tr>
+                                            <td colSpan="5" className="text-center py-6 text-gray-500">
+                                                No records found for selected dates
+                                            </td>
                                         </tr>
-                                    ))
-                                )}
-                                {/* Pad remaining slots so table height stays constant at REWARD_LIMIT rows */}
-                                {paginatedLogs.length > 0 &&
-                                    Array.from({ length: emptyRows }).map((_, i) => (
-                                        <tr key={`reward-empty-${i}`} aria-hidden="true">
-                                            <td className="py-3" colSpan="5">&nbsp;</td>
-                                        </tr>
-                                    ))}
-                            </tbody>
-                        </table>
+                                    ) : (
+                                        logs.map((log) => (
+                                            <tr key={log._id ?? log.id}>
+                                                <td className="py-3 font-medium">
+                                                    {new Date(log.date).toLocaleDateString("en-CA")}
+                                                </td>
+                                                <td>{log.rewardName}</td>
+                                                <td>{log.householdId}</td>
+                                                <td>{log.householdName}</td>
+                                                <td className="text-red-500">{log.stockUpdate}</td>
+                                            </tr>
+                                        ))
+                                    )}
+                                    {/* Pad remaining slots so table height stays constant at REWARD_LIMIT rows */}
+                                    {logs.length > 0 &&
+                                        Array.from({ length: emptyRows }).map((_, i) => (
+                                            <tr key={`reward-empty-${i}`} aria-hidden="true">
+                                                <td className="py-3" colSpan="5">&nbsp;</td>
+                                            </tr>
+                                        ))}
+                                </tbody>
+                            </table>
+                        )}
                     </div>
 
-                    <Pagination
-                        currentPage={page}
-                        totalItems={filteredLogs.length}
-                        itemsPerPage={REWARD_LIMIT}
-                        onPageChange={setPage}
-                    />
+                    {!loading && !error && (
+                        <Pagination
+                            currentPage={page}
+                            totalItems={total}
+                            itemsPerPage={REWARD_LIMIT}
+                            onPageChange={fetchLogs}
+                        />
+                    )}
                 </div>
 
             </div>

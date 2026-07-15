@@ -19,6 +19,7 @@ import AwardModal from "../../components/AwardModal";
 import ClaimReward from "../../components/ClaimReward";
 import BASE_URL from "../../config";
 import Pagination from "../../components/Pagination";
+import useDebounce from "../../hooks/useDebounce";
 
 import { getRewards, createReward, updateReward } from "../../api/rewardApi";
 import { getRules } from "../../api/rulesAPI";
@@ -38,19 +39,22 @@ export default function Gamified() {
     const [pointNeed, setPointNeed] = useState();
     const [clickedRule, setClickRule] = useState(null);
 
-    // ---- Rewards now come from the database ----
+    // ---- Rewards now come from the database (server-paginated) ----
     const [rewards, setRewards] = useState([]);
+    const [rewardsTotal, setRewardsTotal] = useState(0);
     const [rewardsLoading, setRewardsLoading] = useState(true);
     const [rewardsError, setRewardsError] = useState("");
     const [editingRewardId, setEditingRewardId] = useState(null);
 
-    // ---- Rules now come from the database ----
+    // ---- Rules now come from the database (server-paginated) ----
     const [rules, setRules] = useState([]);
+    const [rulesTotal, setRulesTotal] = useState(0);
     const [rulesLoading, setRulesLoading] = useState(true);
     const [rulesError, setRulesError] = useState("");
     const [editRuleData, setEditRuleData] = useState(null); // which rule is being edited
 
     const [rewardLogs, setRewardLogs] = useState([]);
+    const [rewardLogsTotal, setRewardLogsTotal] = useState(0);
     const [rewardLogsLoading, setRewardLogsLoading] = useState(true);
     const [rewardLogsError, setRewardLogsError] = useState("");
 
@@ -64,27 +68,32 @@ export default function Gamified() {
     const [openRewardModal, setOpenRewardModal] = useState(false);
 
     const [search, setSearch] = useState("");
+    const debouncedSearch = useDebounce(search, 400);
 
-    // ── Pagination ──
+    // ── Pagination (server-side) ──
     const [rewardPage, setRewardPage] = useState(1);
     const [rulePage, setRulePage] = useState(1);
     const [logPage, setLogPage] = useState(1);
 
-    const fetchRewards = async () => {
+    // NOTE: `getRewards` / `getRules` (in api/rewardApi.js and
+    // api/rulesAPI.js) need to be updated to accept
+    // `({ search, page, limit }, signal)` and return `{ data, total }`
+    // (or plain array + total) instead of the full unfiltered collection.
+    const fetchRewards = async (signal) => {
         try {
             setRewardsLoading(true);
-            const data = await getRewards();
-
-            if (Array.isArray(data)) {
-                setRewards(data);
-            } else if (data?.data && Array.isArray(data.data)) {
-                setRewards(data.data);
-            } else {
-                setRewards([]);
-            }
-
             setRewardsError("");
+            const res = await getRewards(
+                { search: debouncedSearch, page: rewardPage, limit: REWARDS_PER_PAGE },
+                signal
+            );
+
+            const list = Array.isArray(res) ? res : res?.data ?? [];
+            const total = Array.isArray(res) ? list.length : res?.total ?? list.length;
+            setRewards(list);
+            setRewardsTotal(total);
         } catch (err) {
+            if (err.name === "AbortError") return;
             console.error(err);
             setRewards([]);
             setRewardsError("Failed to load rewards. Is the server running?");
@@ -93,22 +102,21 @@ export default function Gamified() {
         }
     };
 
-    const fetchRules = async () => {
+    const fetchRules = async (signal) => {
         try {
             setRulesLoading(true);
-            const data = await getRules();
-
-            // Handle both response shapes
-            if (Array.isArray(data)) {
-                setRules(data);
-            } else if (data?.data && Array.isArray(data.data)) {
-                setRules(data.data);
-            } else {
-                setRules([]);
-            }
-
             setRulesError("");
+            const res = await getRules(
+                { search: debouncedSearch, page: rulePage, limit: RULES_PER_PAGE },
+                signal
+            );
+
+            const list = Array.isArray(res) ? res : res?.data ?? [];
+            const total = Array.isArray(res) ? list.length : res?.total ?? list.length;
+            setRules(list);
+            setRulesTotal(total);
         } catch (err) {
+            if (err.name === "AbortError") return;
             console.error(err);
             setRules([]);
             setRulesError("Failed to load rules. Is the server running?");
@@ -117,17 +125,21 @@ export default function Gamified() {
         }
     };
 
-    const fetchRewardLogs = async () => {
+    const fetchRewardLogs = async (signal) => {
         try {
             setRewardLogsLoading(true);
-            const res = await fetch(`${BASE_URL}/api/rewards/logs?limit=20`);
+            setRewardLogsError("");
+            const params = new URLSearchParams({ page: logPage, limit: LOGS_PER_PAGE });
+            const res = await fetch(`${BASE_URL}/api/rewards/logs?${params}`, { signal });
             const data = await res.json();
             if (data.success) {
                 setRewardLogs(data.data);
+                setRewardLogsTotal(data.total ?? data.data.length);
             } else {
                 setRewardLogsError("Failed to load reward logs.");
             }
         } catch (err) {
+            if (err.name === "AbortError") return;
             console.error(err);
             setRewardLogsError("Failed to load reward logs.");
         } finally {
@@ -135,17 +147,46 @@ export default function Gamified() {
         }
     };
 
+    // Lazy-load per tab: only fetch a dataset once its tab is actually
+    // visible, and refetch when its own search/page state changes.
     useEffect(() => {
-        fetchRewards();
-        fetchRules();
-        fetchRewardLogs();
-    }, []);
+        if (activeTab !== "rewards") return;
+        const controller = new AbortController();
+        fetchRewards(controller.signal);
+        fetchRewardLogs(controller.signal);
+        return () => controller.abort();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [activeTab, debouncedSearch, rewardPage, logPage]);
+
+    useEffect(() => {
+        if (activeTab !== "rules") return;
+        const controller = new AbortController();
+        fetchRules(controller.signal);
+        return () => controller.abort();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [activeTab, debouncedSearch, rulePage]);
 
     // Reset to page 1 whenever the search term changes
     useEffect(() => {
         setRewardPage(1);
         setRulePage(1);
-    }, [search]);
+    }, [debouncedSearch]);
+
+    // Step back if a page becomes invalid (e.g. after a delete elsewhere)
+    useEffect(() => {
+        const totalPages = Math.max(1, Math.ceil(rewardsTotal / REWARDS_PER_PAGE));
+        if (rewardPage > totalPages) setRewardPage(totalPages);
+    }, [rewardsTotal, rewardPage]);
+
+    useEffect(() => {
+        const totalPages = Math.max(1, Math.ceil(rulesTotal / RULES_PER_PAGE));
+        if (rulePage > totalPages) setRulePage(totalPages);
+    }, [rulesTotal, rulePage]);
+
+    useEffect(() => {
+        const totalPages = Math.max(1, Math.ceil(rewardLogsTotal / LOGS_PER_PAGE));
+        if (logPage > totalPages) setLogPage(totalPages);
+    }, [rewardLogsTotal, logPage]);
 
     const handleRewardEdit = (id) => {
         const item = rewards.find((reward) => reward._id === id);
@@ -198,51 +239,12 @@ export default function Gamified() {
         }
     };
 
-    const filteredData = rewards.filter((h) =>
-        h.name.toLowerCase().includes(search.toLowerCase())
-    );
-
-    const filteredRules = rules.filter((r) =>
-        r.name.toLowerCase().includes(search.toLowerCase())
-    );
-
-    // Keep pages valid whenever the underlying/filtered lists change
-    useEffect(() => {
-        const totalPages = Math.max(1, Math.ceil(filteredData.length / REWARDS_PER_PAGE));
-        if (rewardPage > totalPages) setRewardPage(totalPages);
-    }, [filteredData.length, rewardPage]);
-
-    useEffect(() => {
-        const totalPages = Math.max(1, Math.ceil(filteredRules.length / RULES_PER_PAGE));
-        if (rulePage > totalPages) setRulePage(totalPages);
-    }, [filteredRules.length, rulePage]);
-
-    useEffect(() => {
-        const totalPages = Math.max(1, Math.ceil(rewardLogs.length / LOGS_PER_PAGE));
-        if (logPage > totalPages) setLogPage(totalPages);
-    }, [rewardLogs.length, logPage]);
-
-    const paginatedRewards = filteredData.slice(
-        (rewardPage - 1) * REWARDS_PER_PAGE,
-        rewardPage * REWARDS_PER_PAGE
-    );
-
-    const paginatedRules = filteredRules.slice(
-        (rulePage - 1) * RULES_PER_PAGE,
-        rulePage * RULES_PER_PAGE
-    );
-
-    const paginatedLogs = rewardLogs.slice(
-        (logPage - 1) * LOGS_PER_PAGE,
-        logPage * LOGS_PER_PAGE
-    );
-
     // Placeholder counts so each paginated section keeps a constant number
     // of slots (cards/rows) on screen, regardless of how many real items
     // land on the current page.
-    const rewardEmptySlots = Math.max(0, REWARDS_PER_PAGE - paginatedRewards.length);
-    const ruleEmptySlots = Math.max(0, RULES_PER_PAGE - paginatedRules.length);
-    const logEmptyRows = Math.max(0, LOGS_PER_PAGE - paginatedLogs.length);
+    const rewardEmptySlots = Math.max(0, REWARDS_PER_PAGE - rewards.length);
+    const ruleEmptySlots = Math.max(0, RULES_PER_PAGE - rules.length);
+    const logEmptyRows = Math.max(0, LOGS_PER_PAGE - rewardLogs.length);
 
     return (
         <div className="flex-1">
@@ -405,10 +407,20 @@ export default function Gamified() {
                                 </div>
 
                                 {rewardsLoading && <p className="text-gray-500 mb-4">Loading rewards...</p>}
-                                {rewardsError && <p className="text-red-500 mb-4">{rewardsError}</p>}
+                                {rewardsError && (
+                                    <div className="mb-4">
+                                        <p className="text-red-500 mb-1">{rewardsError}</p>
+                                        <button
+                                            onClick={() => fetchRewards()}
+                                            className="text-sm text-gray-600 underline cursor-pointer"
+                                        >
+                                            Retry
+                                        </button>
+                                    </div>
+                                )}
 
                                 <div className=" overflow-y-auto grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
-                                    {paginatedRewards.map((item) => (
+                                    {rewards.map((item) => (
                                         <div
                                             key={item._id}
                                             className="bg-gray-50 rounded-xl p-4 flex flex-col shadow-lg"
@@ -465,16 +477,13 @@ export default function Gamified() {
                                         </div>
                                     ))}
 
-                                    {!rewardsLoading && filteredData.length === 0 && (
+                                    {!rewardsLoading && rewards.length === 0 && (
                                         <p className="text-gray-500 col-span-full text-center py-6">
                                             No rewards found.
                                         </p>
                                     )}
 
-                                    {/* Invisible placeholder cards so the grid keeps a
-                                        constant number of rows/slots at REWARDS_PER_PAGE,
-                                        even when the current page has fewer items. */}
-                                    {paginatedRewards.length > 0 &&
+                                    {rewards.length > 0 &&
                                         Array.from({ length: rewardEmptySlots }).map((_, i) => (
                                             <div
                                                 key={`reward-empty-${i}`}
@@ -499,7 +508,7 @@ export default function Gamified() {
 
                                 <Pagination
                                     currentPage={rewardPage}
-                                    totalItems={filteredData.length}
+                                    totalItems={rewardsTotal}
                                     itemsPerPage={REWARDS_PER_PAGE}
                                     onPageChange={setRewardPage}
                                 />
@@ -513,7 +522,15 @@ export default function Gamified() {
                                     {rewardLogsLoading ? (
                                         <p className="text-center py-6 text-gray-400">Loading logs...</p>
                                     ) : rewardLogsError ? (
-                                        <p className="text-center py-6 text-red-500">{rewardLogsError}</p>
+                                        <div className="text-center py-6">
+                                            <p className="text-red-500 mb-1">{rewardLogsError}</p>
+                                            <button
+                                                onClick={() => fetchRewardLogs()}
+                                                className="text-sm text-gray-600 underline cursor-pointer"
+                                            >
+                                                Retry
+                                            </button>
+                                        </div>
                                     ) : (
                                         <table className="w-full text-sm">
                                             <thead className="bg-gray-100 sticky top-0">
@@ -526,14 +543,14 @@ export default function Gamified() {
                                                 </tr>
                                             </thead>
                                             <tbody className="text-center">
-                                                {paginatedLogs.length === 0 ? (
+                                                {rewardLogs.length === 0 ? (
                                                     <tr>
                                                         <td colSpan="5" className="text-center py-6 text-gray-500">
                                                             No reward logs yet.
                                                         </td>
                                                     </tr>
                                                 ) : (
-                                                    paginatedLogs.map((log) => (
+                                                    rewardLogs.map((log) => (
                                                         <tr key={log._id} className="hover:bg-gray-50">
                                                             <td className="py-3 font-medium">
                                                                 {new Date(log.date).toLocaleDateString("en-CA")}
@@ -545,9 +562,7 @@ export default function Gamified() {
                                                         </tr>
                                                     ))
                                                 )}
-                                                {/* Pad remaining slots so the table height stays
-                                                    constant at LOGS_PER_PAGE rows. */}
-                                                {paginatedLogs.length > 0 &&
+                                                {rewardLogs.length > 0 &&
                                                     Array.from({ length: logEmptyRows }).map((_, i) => (
                                                         <tr key={`log-empty-${i}`} aria-hidden="true">
                                                             <td className="py-3" colSpan="5">&nbsp;</td>
@@ -560,7 +575,7 @@ export default function Gamified() {
 
                                 <Pagination
                                     currentPage={logPage}
-                                    totalItems={rewardLogs.length}
+                                    totalItems={rewardLogsTotal}
                                     itemsPerPage={LOGS_PER_PAGE}
                                     onPageChange={setLogPage}
                                 />
@@ -609,10 +624,20 @@ export default function Gamified() {
                                 </div>
 
                                 {rulesLoading && <p className="text-gray-500 mb-4">Loading rules...</p>}
-                                {rulesError && <p className="text-red-500 mb-4">{rulesError}</p>}
+                                {rulesError && (
+                                    <div className="mb-4">
+                                        <p className="text-red-500 mb-1">{rulesError}</p>
+                                        <button
+                                            onClick={() => fetchRules()}
+                                            className="text-sm text-gray-600 underline cursor-pointer"
+                                        >
+                                            Retry
+                                        </button>
+                                    </div>
+                                )}
 
                                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                                    {paginatedRules.map((r, idx) => (
+                                    {rules.map((r, idx) => (
                                         <div
                                             key={r._id}
                                             className="relative bg-gray-50 rounded-xl flex flex-col shadow-lg"
@@ -680,16 +705,13 @@ export default function Gamified() {
                                         </div>
                                     ))}
 
-                                    {!rulesLoading && filteredRules.length === 0 && (
+                                    {!rulesLoading && rules.length === 0 && (
                                         <p className="text-gray-500 col-span-full text-center py-6">
                                             No rules found.
                                         </p>
                                     )}
 
-                                    {/* Invisible placeholder cards so the grid keeps a
-                                        constant number of rows/slots at RULES_PER_PAGE,
-                                        even when the current page has fewer items. */}
-                                    {paginatedRules.length > 0 &&
+                                    {rules.length > 0 &&
                                         Array.from({ length: ruleEmptySlots }).map((_, i) => (
                                             <div
                                                 key={`rule-empty-${i}`}
@@ -714,7 +736,7 @@ export default function Gamified() {
 
                                 <Pagination
                                     currentPage={rulePage}
-                                    totalItems={filteredRules.length}
+                                    totalItems={rulesTotal}
                                     itemsPerPage={RULES_PER_PAGE}
                                     onPageChange={setRulePage}
                                 />

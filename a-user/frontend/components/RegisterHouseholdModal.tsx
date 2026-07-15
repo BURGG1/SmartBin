@@ -455,11 +455,11 @@ export default function RegisterHousehold({ isOpen, onClose }: RegisterHousehold
                     onRequestClose={() => setStreetPickerOpen(false)}
                 >
                     <Pressable
-                        className="flex-1 bg-black/40 justify-end"
+                        className="flex-1 bg-black/40 justify-end items-center p-4"
                         onPress={() => setStreetPickerOpen(false)}
                     >
                         <Pressable
-                            className="bg-white rounded-t-2xl max-h-[70%]"
+                            className="w-[90%] bg-white rounded-t-2xl max-h-[70%]"
                             onPress={() => { }}
                         >
                             <View className="flex-row justify-between items-center px-5 py-4 border-b border-gray-200">

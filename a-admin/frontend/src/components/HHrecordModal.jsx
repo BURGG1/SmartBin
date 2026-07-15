@@ -1,5 +1,5 @@
 import { X, Calendar, Clipboard, Trash2, Award } from "lucide-react";
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import AssignPointsModal from "./AssignPointsModal";
 import Pagination from "./Pagination";
 import BASE_URL from "../config";
@@ -33,9 +33,11 @@ export default function HouseholdRecordModal({ isOpen, onClose, household: house
 
     // Disposal logs
     const [disposalLogs, setDisposalLogs]   = useState([]);
+    const [disposalTotal, setDisposalTotal] = useState(0);
     const [logsLoading, setLogsLoading]     = useState(false);
     const [logsError, setLogsError]         = useState("");
     const [disposalPage, setDisposalPage]   = useState(1);
+    const disposalAbortRef                  = useRef(null);
 
     // Activity logs
     const [activityLogs, setActivityLogs]       = useState([]);
@@ -43,6 +45,7 @@ export default function HouseholdRecordModal({ isOpen, onClose, household: house
     const [activityError, setActivityError]     = useState("");
     const [activityPage, setActivityPage]       = useState(1);
     const [activityTotal, setActivityTotal]     = useState(0);
+    const activityAbortRef                      = useRef(null);
 
     const fetchHousehold = useCallback(async () => {
         if (!householdProp?._id) return;
@@ -55,76 +58,109 @@ export default function HouseholdRecordModal({ isOpen, onClose, household: house
         }
     }, [householdProp?._id]);
 
-    const fetchDisposalLogs = useCallback(async () => {
+    // ── Fetch a single page of disposal logs from the server ─────────────────
+    const fetchDisposalLogs = useCallback(async (pageArg = 1) => {
         if (!householdProp?.rfid) return;
+
+        disposalAbortRef.current?.abort();
+        const controller = new AbortController();
+        disposalAbortRef.current = controller;
+
         setLogsLoading(true);
         setLogsError("");
         try {
-            const res  = await fetch(`${BASE_URL}/api/rfid/logs/${householdProp.rfid}`);
+            const params = new URLSearchParams({
+                action: "dispose",
+                page: pageArg,
+                limit: DISPOSAL_LIMIT,
+                ...(fromDate && { from: fromDate }),
+                ...(toDate   && { to: toDate }),
+            });
+
+            const res  = await fetch(`${BASE_URL}/api/rfid/logs/${householdProp.rfid}?${params}`, {
+                signal: controller.signal,
+            });
             const data = await res.json();
+
             if (data.success) {
+                // Safety net in case the backend ever returns mixed actions
                 setDisposalLogs(data.data.filter((log) => log.action === "dispose"));
+                setDisposalTotal(data.pagination?.total ?? data.data.length);
+                setDisposalPage(pageArg);
             } else {
                 setLogsError("Failed to load disposal logs.");
             }
-        } catch {
-            setLogsError("Network error. Could not load logs.");
+        } catch (err) {
+            if (err.name !== "AbortError") setLogsError("Network error. Could not load logs.");
         } finally {
-            setLogsLoading(false);
+            if (disposalAbortRef.current === controller) setLogsLoading(false);
         }
-    }, [householdProp?.rfid]);
+    }, [householdProp?.rfid, fromDate, toDate]);
 
-    const fetchActivityLogs = useCallback(async (page = 1) => {
+    const fetchActivityLogs = useCallback(async (pageArg = 1) => {
         if (!householdProp?._id) return;
+
+        activityAbortRef.current?.abort();
+        const controller = new AbortController();
+        activityAbortRef.current = controller;
+
         setActivityLoading(true);
         setActivityError("");
         try {
             const params = new URLSearchParams({
-                page,
+                page: pageArg,
                 limit: ACTIVITY_LIMIT,
                 ...(fromDate && { from: fromDate }),
                 ...(toDate   && { to: toDate }),
             });
 
-            const res  = await fetch(`${BASE_URL}/api/households/${householdProp._id}/activity?${params}`);
+            const res  = await fetch(`${BASE_URL}/api/households/${householdProp._id}/activity?${params}`, {
+                signal: controller.signal,
+            });
             const data = await res.json();
 
             if (data.success) {
                 setActivityLogs(data.data);
                 setActivityTotal(data.pagination?.total ?? 0);
-                setActivityPage(page);
+                setActivityPage(pageArg);
             } else {
                 setActivityError("Failed to load activity logs.");
             }
-        } catch {
-            setActivityError("Network error. Could not load activity.");
+        } catch (err) {
+            if (err.name !== "AbortError") setActivityError("Network error. Could not load activity.");
         } finally {
-            setActivityLoading(false);
+            if (activityAbortRef.current === controller) setActivityLoading(false);
         }
     }, [householdProp?._id, fromDate, toDate]);
 
+    // ── On open: load everything fresh ───────────────────────────────────────
     useEffect(() => {
         if (!isOpen || !householdProp?._id) return;
         setHousehold(householdProp);
         fetchHousehold();
-        fetchDisposalLogs();
+        fetchDisposalLogs(1);
         fetchActivityLogs(1);
         setActiveTab("disposal");
         setFromDate("");
         setToDate("");
-        setActivityPage(1);
-        setDisposalPage(1);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [isOpen, householdProp?._id]);
 
+    // ── Re-fetch the active tab's data whenever the date filter changes ──────
     useEffect(() => {
-        if (!isOpen || activeTab !== "reward") return;
-        fetchActivityLogs(1);
+        if (!isOpen) return;
+        if (activeTab === "reward") fetchActivityLogs(1);
+        if (activeTab === "disposal") fetchDisposalLogs(1);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [fromDate, toDate]);
 
-    useEffect(() => {
-        setDisposalPage(1);
-    }, [fromDate, toDate]);
+    // Cancel any pending requests on unmount
+    useEffect(() => () => {
+        disposalAbortRef.current?.abort();
+        activityAbortRef.current?.abort();
+    }, []);
 
+    // ── Called after points are awarded ──────────────────────────────────────
     const handlePointsAwarded = useCallback(async () => {
         await fetchHousehold();
         await fetchActivityLogs(1);
@@ -145,20 +181,7 @@ export default function HouseholdRecordModal({ isOpen, onClose, household: house
     const violation       = household.violation ?? 0;
     const suffix          = ["st", "nd", "rd"];
 
-    const filteredLogs = disposalLogs.filter((log) => {
-        if (!fromDate && !toDate) return true;
-        const logDate = new Date(log.scannedAt);
-        return (
-            (!fromDate || logDate >= new Date(fromDate)) &&
-            (!toDate   || logDate <= new Date(toDate))
-        );
-    });
-
-    const paginatedDisposalLogs = filteredLogs.slice(
-        (disposalPage - 1) * DISPOSAL_LIMIT,
-        disposalPage * DISPOSAL_LIMIT
-    );
-    const disposalEmptyRows = Math.max(0, DISPOSAL_LIMIT - paginatedDisposalLogs.length);
+    const disposalEmptyRows = Math.max(0, DISPOSAL_LIMIT - disposalLogs.length);
     const activityEmptyRows = Math.max(0, ACTIVITY_LIMIT - activityLogs.length);
 
     return (
@@ -242,6 +265,7 @@ export default function HouseholdRecordModal({ isOpen, onClose, household: house
                             onClick={() => {
                                 setActiveTab(tab.id);
                                 if (tab.id === "reward") fetchActivityLogs(1);
+                                if (tab.id === "disposal") fetchDisposalLogs(1);
                             }}
                             className={`flex items-center m-0 justify-center md:justify-between cursor-pointer gap-2 px-4 py-1 whitespace-nowrap transition ${
                                 activeTab === tab.id
@@ -275,14 +299,14 @@ export default function HouseholdRecordModal({ isOpen, onClose, household: house
                                         </tr>
                                     </thead>
                                     <tbody className="text-center">
-                                        {paginatedDisposalLogs.length === 0 && disposalEmptyRows === DISPOSAL_LIMIT ? (
+                                        {disposalLogs.length === 0 ? (
                                             <tr>
                                                 <td colSpan="5" className="text-center py-6 text-gray-500">
                                                     No records found for selected dates
                                                 </td>
                                             </tr>
                                         ) : (
-                                            paginatedDisposalLogs.map((log) => {
+                                            disposalLogs.map((log) => {
                                                 const scannedAt    = new Date(log.scannedAt);
                                                 const date         = scannedAt.toLocaleDateString("en-CA");
                                                 const time         = scannedAt.toLocaleTimeString("en-US", {
@@ -305,7 +329,7 @@ export default function HouseholdRecordModal({ isOpen, onClose, household: house
                                             })
                                         )}
                                         {/* Pad remaining slots so table height stays constant at DISPOSAL_LIMIT rows */}
-                                        {paginatedDisposalLogs.length > 0 &&
+                                        {disposalLogs.length > 0 &&
                                             Array.from({ length: disposalEmptyRows }).map((_, i) => (
                                                 <tr key={`disposal-empty-${i}`} aria-hidden="true">
                                                     <td className="py-3" colSpan="5">&nbsp;</td>
@@ -319,9 +343,9 @@ export default function HouseholdRecordModal({ isOpen, onClose, household: house
                         {!logsLoading && !logsError && (
                             <Pagination
                                 currentPage={disposalPage}
-                                totalItems={filteredLogs.length}
+                                totalItems={disposalTotal}
                                 itemsPerPage={DISPOSAL_LIMIT}
-                                onPageChange={setDisposalPage}
+                                onPageChange={fetchDisposalLogs}
                             />
                         )}
                     </div>

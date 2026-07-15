@@ -4,6 +4,7 @@ import NavigationShell from "../../navigation/mainNav";
 import Footer from "../../components/Footer";
 import AddHousehold from "../../components/AddHouseholdModal";
 import Pagination from "../../components/Pagination";
+import useDebounce from "../../hooks/useDebounce";
 
 import {
     MailPlus,
@@ -19,26 +20,11 @@ import AssignRFIDModal from "../../components/AssignRFID";
 const REQUESTS_PER_PAGE = 10;
 const HOUSEHOLDS_PER_PAGE = 10;
 
-const householdRequest = [
-    {
-        id: 1,
-        name: "Jay Robles",
-        address: "Rizal St.",
-        email: "jayrobles100@gmail.com",
-        contact: "091234567890",
-    },
-    {
-        id: 2,
-        name: "Amado Crisostomo",
-        address: "Mabini St",
-        email: "crisostomomado@gmail.com",
-        contact: "09987654321",
-    },
-];
-
 function RequestTab() {
     const [requests, setRequests] = useState([]);
+    const [requestTotal, setRequestTotal] = useState(0);
     const [loading, setLoading] = useState(true);
+    const [requestError, setRequestError] = useState("");
     const [active, setActive] = useState(false);
     const [openRFIDmodal, setopenRFIDmodal] = useState(false);
     const [selectedRequest, setSelectedRequest] = useState(null);
@@ -46,39 +32,53 @@ function RequestTab() {
     const [declineActive, setDeclineActive] = useState(false);
     const [selectedDeclineId, setSelectedDeclineId] = useState(null);
 
-    // ── Pagination ──
+    // ── Pagination (server-side) ──
     const [requestPage, setRequestPage] = useState(1);
 
-    const fetchRequests = async () => {
+    const fetchRequests = async (signal) => {
         setLoading(true);
+        setRequestError("");
         try {
-            const res = await fetch(`${BASE_URL}/api/requests?status=pending`);
+            const params = new URLSearchParams({
+                status: "pending",
+                page: requestPage,
+                limit: REQUESTS_PER_PAGE,
+            });
+            const res = await fetch(`${BASE_URL}/api/requests?${params}`, { signal });
             const data = await res.json();
-            if (data.success) setRequests(data.data);
+            if (data.success) {
+                setRequests(data.data);
+                // Backend should return a `total` count of ALL matching
+                // pending requests (not just this page) so the pager knows
+                // how many pages exist.
+                setRequestTotal(data.total ?? data.data.length);
+            } else {
+                setRequestError("Failed to load requests.");
+            }
         } catch (err) {
+            if (err.name === "AbortError") return;
             console.error(err);
+            setRequestError("Cannot connect to server.");
         } finally {
             setLoading(false);
         }
     };
 
     useEffect(() => {
-        fetchRequests();
-    }, []);
+        const controller = new AbortController();
+        fetchRequests(controller.signal);
+        return () => controller.abort();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [requestPage]);
 
+    // If an approve/decline shrinks the total below the current page,
+    // step back to the last valid page.
     useEffect(() => {
-        const totalPages = Math.max(1, Math.ceil(requests.length / REQUESTS_PER_PAGE));
+        const totalPages = Math.max(1, Math.ceil(requestTotal / REQUESTS_PER_PAGE));
         if (requestPage > totalPages) setRequestPage(totalPages);
-    }, [requests, requestPage]);
+    }, [requestTotal, requestPage]);
 
-    const paginatedRequests = requests.slice(
-        (requestPage - 1) * REQUESTS_PER_PAGE,
-        requestPage * REQUESTS_PER_PAGE
-    );
-    // Placeholder row count so the table keeps a constant height at
-    // REQUESTS_PER_PAGE rows, regardless of how many requests land on the
-    // current page.
-    const requestEmptyRows = Math.max(0, REQUESTS_PER_PAGE - paginatedRequests.length);
+    const requestEmptyRows = Math.max(0, REQUESTS_PER_PAGE - requests.length);
 
     const handleApprove = (item) => {
         setSelectedRequest(item);
@@ -168,7 +168,19 @@ function RequestTab() {
 
             {loading && <p className="text-center text-gray-400 py-8">Loading requests...</p>}
 
-            {!loading && (
+            {!loading && requestError && (
+                <div className="text-center py-8">
+                    <p className="text-red-500 mb-2">{requestError}</p>
+                    <button
+                        onClick={() => fetchRequests()}
+                        className="text-sm text-gray-600 underline cursor-pointer"
+                    >
+                        Retry
+                    </button>
+                </div>
+            )}
+
+            {!loading && !requestError && (
                 <div className="overflow-x-auto">
                     <table className="w-full min-w-[800px]">
                         <thead className="bg-gray-50 text-center">
@@ -189,7 +201,7 @@ function RequestTab() {
                                 </tr>
                             ) : (
                                 <>
-                                    {paginatedRequests.map((item) => (
+                                    {requests.map((item) => (
                                         <tr key={item._id} className="hover:bg-gray-50 text-center">
                                             <td className="px-4 py-3 font-medium">{item.fullname}</td>
                                             <td className="px-4 py-3 text-gray-600">
@@ -215,8 +227,6 @@ function RequestTab() {
                                             </td>
                                         </tr>
                                     ))}
-                                    {/* Pad remaining slots so the table height stays
-                                        constant at REQUESTS_PER_PAGE rows. */}
                                     {Array.from({ length: requestEmptyRows }).map((_, i) => (
                                         <tr key={`request-empty-${i}`} aria-hidden="true">
                                             <td className="px-4 py-3" colSpan={5}>&nbsp;</td>
@@ -229,7 +239,7 @@ function RequestTab() {
 
                     <Pagination
                         currentPage={requestPage}
-                        totalItems={requests.length}
+                        totalItems={requestTotal}
                         itemsPerPage={REQUESTS_PER_PAGE}
                         onPageChange={setRequestPage}
                     />
@@ -274,30 +284,39 @@ export default function HouseholdInfo() {
     const [activeHousehold, setActiveHousehold] = useState(null);
 
     const [search, setSearch] = useState("");
+    const debouncedSearch = useDebounce(search, 400);
 
     // ── DB state ──────────────────────────────────────
     const [householdRecords, setHouseholdRecords] = useState([]);
+    const [householdTotal, setHouseholdTotal] = useState(0);
     const [loadingHouseholds, setLoadingHouseholds] = useState(true);
     const [fetchError, setFetchError] = useState("");
 
-    // ── Pagination ──
+    // ── Pagination (server-side) ──
     const [householdPage, setHouseholdPage] = useState(1);
 
     // ── Fetch households from backend ─────────────────
-    const fetchHouseholds = async () => {
+    const fetchHouseholds = async (signal) => {
         setLoadingHouseholds(true);
         setFetchError("");
         try {
-            const res = await fetch(
-                `${BASE_URL}/api/households?search=${search}&limit=100`
-            );
+            const params = new URLSearchParams({
+                search: debouncedSearch,
+                page: householdPage,
+                limit: HOUSEHOLDS_PER_PAGE,
+            });
+            const res = await fetch(`${BASE_URL}/api/households?${params}`, { signal });
             const data = await res.json();
             if (data.success) {
                 setHouseholdRecords(data.data);
+                // Backend must return `total` = count of ALL households
+                // matching the search, not just this page's length.
+                setHouseholdTotal(data.total ?? data.data.length);
             } else {
                 setFetchError("Failed to load households.");
             }
         } catch (err) {
+            if (err.name === "AbortError") return;
             setFetchError("Cannot connect to server. Make sure the backend is running.");
         } finally {
             setLoadingHouseholds(false);
@@ -305,13 +324,23 @@ export default function HouseholdInfo() {
     };
 
     useEffect(() => {
-        fetchHouseholds();
-    }, [search]);
+        const controller = new AbortController();
+        fetchHouseholds(controller.signal);
+        return () => controller.abort();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [debouncedSearch, householdPage]);
 
-    // Reset to page 1 whenever the search term changes
+    // Reset to page 1 whenever the (debounced) search term changes
     useEffect(() => {
         setHouseholdPage(1);
-    }, [search]);
+    }, [debouncedSearch]);
+
+    // If the total shrinks below the current page (e.g. a record was
+    // removed elsewhere), step back to the last valid page.
+    useEffect(() => {
+        const totalPages = Math.max(1, Math.ceil(householdTotal / HOUSEHOLDS_PER_PAGE));
+        if (householdPage > totalPages) setHouseholdPage(totalPages);
+    }, [householdTotal, householdPage]);
 
     const handleAddModalClose = () => {
         setOpenAddModal(false);
@@ -323,28 +352,7 @@ export default function HouseholdInfo() {
         setopenRFIDmodal(true);
     };
 
-    const filteredData = householdRecords.filter((h) => {
-        return (
-            h.fullname?.toLowerCase().includes(search.toLowerCase()) ||
-            h._id?.toLowerCase().includes(search.toLowerCase()) ||
-            h.rfidUid?.toLowerCase().includes(search.toLowerCase())
-        );
-    });
-
-    // Keep the current page valid whenever the filtered list changes
-    useEffect(() => {
-        const totalPages = Math.max(1, Math.ceil(filteredData.length / HOUSEHOLDS_PER_PAGE));
-        if (householdPage > totalPages) setHouseholdPage(totalPages);
-    }, [filteredData.length, householdPage]);
-
-    const paginatedHouseholdData = filteredData.slice(
-        (householdPage - 1) * HOUSEHOLDS_PER_PAGE,
-        householdPage * HOUSEHOLDS_PER_PAGE
-    );
-    // Placeholder row count so the table keeps a constant height at
-    // HOUSEHOLDS_PER_PAGE rows, regardless of how many households land on
-    // the current page.
-    const householdEmptyRows = Math.max(0, HOUSEHOLDS_PER_PAGE - paginatedHouseholdData.length);
+    const householdEmptyRows = Math.max(0, HOUSEHOLDS_PER_PAGE - householdRecords.length);
 
     return (
         <div className="flex-1">
@@ -430,8 +438,16 @@ export default function HouseholdInfo() {
                             {loadingHouseholds && (
                                 <p className="text-center text-gray-400 py-8">Loading households...</p>
                             )}
-                            {fetchError && (
-                                <p className="text-center text-red-500 py-8">{fetchError}</p>
+                            {!loadingHouseholds && fetchError && (
+                                <div className="text-center py-8">
+                                    <p className="text-red-500 mb-2">{fetchError}</p>
+                                    <button
+                                        onClick={() => fetchHouseholds()}
+                                        className="text-sm text-gray-600 underline cursor-pointer"
+                                    >
+                                        Retry
+                                    </button>
+                                </div>
                             )}
 
                             {/* Table */}
@@ -450,7 +466,7 @@ export default function HouseholdInfo() {
                                         </thead>
 
                                         <tbody>
-                                            {filteredData.length === 0 ? (
+                                            {householdRecords.length === 0 ? (
                                                 <tr>
                                                     <td colSpan={6} className="text-center py-8 text-gray-400">
                                                         No households found.
@@ -458,7 +474,7 @@ export default function HouseholdInfo() {
                                                 </tr>
                                             ) : (
                                                 <>
-                                                    {paginatedHouseholdData.map((item) => (
+                                                    {householdRecords.map((item) => (
                                                         <tr key={item._id} className="hover:bg-gray-50 text-center">
                                                             <td className="px-4 py-3 font-mono text-sm">
                                                                 {item._id.slice(-8).toUpperCase()}
@@ -476,7 +492,6 @@ export default function HouseholdInfo() {
                                                                 {item.rfid || "—"}
                                                             </td>
                                                             <td className="px-4 py-3">
-                                                                {/* ── Pass the full item object to the modal ── */}
                                                                 <button
                                                                     onClick={() => setActiveHousehold(item)}
                                                                     className="cursor-pointer bg-gray-900 text-white px-3 py-1 rounded-lg"
@@ -486,8 +501,6 @@ export default function HouseholdInfo() {
                                                             </td>
                                                         </tr>
                                                     ))}
-                                                    {/* Pad remaining slots so the table height stays
-                                                        constant at HOUSEHOLDS_PER_PAGE rows. */}
                                                     {Array.from({ length: householdEmptyRows }).map((_, i) => (
                                                         <tr key={`household-empty-${i}`} aria-hidden="true">
                                                             <td className="px-4 py-3" colSpan={6}>&nbsp;</td>
@@ -500,7 +513,7 @@ export default function HouseholdInfo() {
 
                                     <Pagination
                                         currentPage={householdPage}
-                                        totalItems={filteredData.length}
+                                        totalItems={householdTotal}
                                         itemsPerPage={HOUSEHOLDS_PER_PAGE}
                                         onPageChange={setHouseholdPage}
                                     />

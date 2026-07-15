@@ -1,9 +1,9 @@
 import { X, Calendar } from "lucide-react";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import ViolationModal from "./ViolationModal";
 import Pagination from "./Pagination";
+import BASE_URL from "../config";
 
-const API = "http://localhost:5000/api";
 const LOGS_LIMIT = 7;
 
 export default function CounterInfoModal({ isOpen, onClose, bin }) {
@@ -12,53 +12,74 @@ export default function CounterInfoModal({ isOpen, onClose, bin }) {
     const [activeHH, setActiveHH]     = useState(null);
     const [fromDate, setFromDate]     = useState("");
     const [disposalLogs, setDisposalLogs] = useState([]);
+    const [total, setTotal]           = useState(0);
     const [loading, setLoading]       = useState(false);
     const [error, setError]           = useState("");
     const [page, setPage]             = useState(1);
 
+    const abortRef = useRef(null);
+
+    // ── Fetch a single page of logs from the server (not the whole history) ──
+    const fetchLogs = useCallback(async (pageArg = 1) => {
+        if (!bin?.id) return;
+
+        // Cancel any in-flight request so a slow, stale response can't
+        // overwrite what a faster, newer request already returned
+        abortRef.current?.abort();
+        const controller = new AbortController();
+        abortRef.current = controller;
+
+        setLoading(true);
+        setError("");
+        try {
+            const params = new URLSearchParams({
+                binId: bin.id,
+                action: "dispose",
+                page: pageArg,
+                limit: LOGS_LIMIT,
+                ...(fromDate && { date: fromDate }),
+            });
+
+            const res  = await fetch(`${BASE_URL}/api/rfid/logs?${params}`, { signal: controller.signal });
+            const data = await res.json();
+
+            if (data.success) {
+                setDisposalLogs(data.data);
+                setTotal(data.pagination?.total ?? data.data.length);
+                setPage(pageArg);
+            } else {
+                setError("Failed to load logs.");
+            }
+        } catch (err) {
+            if (err.name !== "AbortError") {
+                setError("Network error. Could not load logs.");
+            }
+        } finally {
+            if (abortRef.current === controller) setLoading(false);
+        }
+    }, [bin?.id, fromDate]);
+
+    // On open (or bin change): reset filters and load page 1
     useEffect(() => {
         if (!isOpen || !bin?.id) return;
-
-        const fetchLogs = async () => {
-            setLoading(true);
-            setError("");
-            try {
-                const res  = await fetch(`${API}/rfid/logs?binId=${bin.id}&action=dispose`);
-                const data = await res.json();
-                if (data.success) {
-                    setDisposalLogs(data.data);
-                } else {
-                    setError("Failed to load logs.");
-                }
-            } catch (err) {
-                setError("Network error. Could not load logs.");
-            } finally {
-                setLoading(false);
-            }
-        };
-
-        fetchLogs();
-        setPage(1);
         setFromDate("");
+        fetchLogs(1);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [isOpen, bin?.id]);
 
+    // Re-fetch page 1 whenever the date filter changes
     useEffect(() => {
-        setPage(1);
+        if (!isOpen || !bin?.id) return;
+        fetchLogs(1);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [fromDate]);
+
+    // Cancel any pending request if the component unmounts mid-fetch
+    useEffect(() => () => abortRef.current?.abort(), []);
 
     if (!isOpen || !bin) return null;
 
-    const filteredLogs = disposalLogs.filter((log) => {
-        if (!fromDate) return true;
-        const logDate = new Date(log.scannedAt).toISOString().split("T")[0];
-        return logDate === fromDate;
-    });
-
-    const paginatedLogs = filteredLogs.slice(
-        (page - 1) * LOGS_LIMIT,
-        page * LOGS_LIMIT
-    );
-    const emptyRows = Math.max(0, LOGS_LIMIT - paginatedLogs.length);
+    const emptyRows = Math.max(0, LOGS_LIMIT - disposalLogs.length);
 
     return (
         <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4">
@@ -111,14 +132,14 @@ export default function CounterInfoModal({ isOpen, onClose, bin }) {
                                 </tr>
                             </thead>
                             <tbody className="text-center">
-                                {paginatedLogs.length === 0 ? (
+                                {disposalLogs.length === 0 ? (
                                     <tr>
                                         <td colSpan="7" className="text-center py-6 text-gray-500">
                                             No records found for selected dates
                                         </td>
                                     </tr>
                                 ) : (
-                                    paginatedLogs.map((log) => {
+                                    disposalLogs.map((log) => {
                                         const scannedAt = new Date(log.scannedAt);
                                         const date      = scannedAt.toISOString().split("T")[0];
                                         const time      = scannedAt.toLocaleTimeString("en-US", {
@@ -161,7 +182,7 @@ export default function CounterInfoModal({ isOpen, onClose, bin }) {
                                     })
                                 )}
                                 {/* Pad remaining slots so table height stays constant at LOGS_LIMIT rows */}
-                                {paginatedLogs.length > 0 &&
+                                {disposalLogs.length > 0 &&
                                     Array.from({ length: emptyRows }).map((_, i) => (
                                         <tr key={`counter-empty-${i}`} aria-hidden="true">
                                             <td className="py-3" colSpan="7">&nbsp;</td>
@@ -176,9 +197,9 @@ export default function CounterInfoModal({ isOpen, onClose, bin }) {
                     <div className="px-6 pb-2">
                         <Pagination
                             currentPage={page}
-                            totalItems={filteredLogs.length}
+                            totalItems={total}
                             itemsPerPage={LOGS_LIMIT}
-                            onPageChange={setPage}
+                            onPageChange={fetchLogs}
                         />
                     </div>
                 )}

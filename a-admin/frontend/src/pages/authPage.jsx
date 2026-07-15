@@ -2,12 +2,14 @@ import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Trash2, Mail, Lock, Eye, EyeOff } from "lucide-react";
 import BASE_URL from "../config";
+import ForgotPasswordModal from "../components/ForgotPasswordModal";
 
 export default function AuthPage() {
   const [form, setForm] = useState({ email: "", password: "" });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [showPassword, setShowPassword] = useState(false);
+  const [isForgotPasswordOpen, setIsForgotPasswordOpen] = useState(false);
   const navigate = useNavigate();
 
   const handleChange = (e) =>
@@ -163,13 +165,21 @@ export default function AuthPage() {
 
           <p className="text-sm text-gray-500">
             Forgot your password?{" "}
-            <span className="text-green-600 font-medium cursor-pointer">
+            <span
+              onClick={() => setIsForgotPasswordOpen(true)}
+              className="text-green-600 font-medium cursor-pointer hover:underline"
+            >
               Reset here
             </span>
           </p>
 
         </div>
       </div>
+
+      <ForgotPasswordModal
+        isOpen={isForgotPasswordOpen}
+        onClose={() => setIsForgotPasswordOpen(false)}
+      />
     </div>
   );
 }

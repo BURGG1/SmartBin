@@ -1,57 +1,147 @@
-import { useState } from "react";
-import { View, Text, TextInput, TouchableOpacity, Alert } from "react-native";
+import { useCallback, useRef, useState } from "react";
+import { View, Text, TextInput, TouchableOpacity, Alert, ActivityIndicator } from "react-native";
 import { Feather } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
 import { API_BASE } from "@/config";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import RegisterHousehold from "@/components/RegisterHouseholdModal";
+import ForgotPasswordModal from "@/components/ForgotPasswordModal";
+// --- Config / constants -----------------------------------------------
+
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const REQUEST_TIMEOUT_MS = 15000;
+const MAX_ATTEMPTS = 5;
+const LOCKOUT_MS = 60_000; // client-side cool-down after repeated failures
+
+// --- Types ---------------------------------------------------------------
+
+interface LoginForm {
+  email: string;
+  password: string;
+}
+
+interface LoginResponse {
+  success?: boolean;
+  message?: string;
+  token?: string;
+  role?: string;
+  user?: Record<string, unknown>;
+}
+
+// --- Helpers ------------------------------------------------------------
+
+async function fetchWithTimeout(
+  url: string,
+  options: RequestInit,
+  timeoutMs: number
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 export default function AuthPage() {
   const router = useRouter();
-  const [form, setForm] = useState({ email: "", password: "" });
-  const [isModalOpen, setIsModalOpen] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [showPassword, setShowPassword] = useState(false);
+  const [form, setForm] = useState<LoginForm>({ email: "", password: "" });
+  const [isRegisterOpen, setIsRegisterOpen] = useState<boolean>(false);
+  const [isForgotPasswordOpen, setIsForgotPasswordOpen] = useState<boolean>(false);
+  const [loading, setLoading] = useState<boolean>(false);
+  const [showPassword, setShowPassword] = useState<boolean>(false);
 
-  const handleLogin = async () => {
-    if (!form.email || !form.password) {
-      Alert.alert("Error", "Please enter your email and password.");
+  // Client-side throttling. UX safety net only — the server MUST enforce
+  // its own rate limiting, since any client-side check can be bypassed.
+  const attemptsRef = useRef<number>(0);
+  const lockedUntilRef = useRef<number>(0);
+  const inFlightRef = useRef<boolean>(false);
+
+  const isLockedOut = useCallback((): boolean => {
+    const now = Date.now();
+    if (now < lockedUntilRef.current) {
+      const secondsLeft = Math.ceil((lockedUntilRef.current - now) / 1000);
+      Alert.alert("Too many attempts", `Please wait ${secondsLeft}s before trying again.`);
+      return true;
+    }
+    return false;
+  }, []);
+
+  const registerFailedAttempt = useCallback(() => {
+    attemptsRef.current += 1;
+    if (attemptsRef.current >= MAX_ATTEMPTS) {
+      lockedUntilRef.current = Date.now() + LOCKOUT_MS;
+      attemptsRef.current = 0;
+    }
+  }, []);
+
+  const handleLogin = useCallback(async (): Promise<void> => {
+    if (inFlightRef.current) return;
+    if (isLockedOut()) return;
+
+    const email = form.email.trim().toLowerCase();
+    if (!email || !EMAIL_REGEX.test(email)) {
+      Alert.alert("Error", "Please enter a valid email address.");
+      return;
+    }
+    if (!form.password) {
+      Alert.alert("Error", "Please enter your password.");
       return;
     }
 
+    inFlightRef.current = true;
     setLoading(true);
+
     try {
-      const response = await fetch(`${API_BASE}/api/auth/login`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          email: form.email.trim().toLowerCase(),
-          password: form.password,
-        }),
-      });
+      const response = await fetchWithTimeout(
+        `${API_BASE}/api/auth/login`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email, password: form.password }),
+        },
+        REQUEST_TIMEOUT_MS
+      );
 
-      const data = await response.json();
+      let data: LoginResponse | null;
+      try {
+        data = (await response.json()) as LoginResponse;
+      } catch {
+        data = null;
+      }
 
-      if (!response.ok || !data.success) {
-        Alert.alert("Login Failed", data.message || "Invalid credentials.");
+      if (!response.ok || !data?.success) {
+        registerFailedAttempt();
+        Alert.alert("Login Failed", data?.message || "Invalid credentials.");
         return;
       }
 
-      // Store token and user info
-      await AsyncStorage.setItem("token", data.token);
-      await AsyncStorage.setItem("user", JSON.stringify(data.user));
+      attemptsRef.current = 0;
+
+      await AsyncStorage.setItem("token", data.token ?? "");
+      await AsyncStorage.setItem("user", JSON.stringify(data.user ?? {}));
+
+      // Clear the password from local state now that we're done with it.
+      setForm((f) => ({ ...f, password: "" }));
 
       if (data.role === "collector") {
         router.replace("/(collectorTabs)/home");
       } else {
         router.replace("/(userTabs)/home");
       }
-    } catch (err) {
-      Alert.alert("Error", "Cannot connect to server. Make sure the backend is running.");
+    } catch (err: unknown) {
+      if (err instanceof Error && err.name === "AbortError") {
+        Alert.alert("Error", "The request timed out. Please try again.");
+      } else {
+        if (__DEV__) console.warn("Login request failed:", err);
+        Alert.alert("Error", "Cannot connect to server. Make sure the backend is running.");
+      }
     } finally {
+      inFlightRef.current = false;
       setLoading(false);
     }
-  };
+  }, [form, isLockedOut, registerFailedAttempt, router]);
 
   return (
     <View className="flex-1 bg-gray-100 justify-center px-4">
@@ -87,10 +177,16 @@ export default function AuthPage() {
               <TextInput
                 placeholder="Enter your email"
                 value={form.email}
-                onChangeText={(text) => setForm({ ...form, email: text })}
+                onChangeText={(text: string) => setForm((f) => ({ ...f, email: text }))}
                 className="flex-1 ml-3"
                 autoCapitalize="none"
+                autoCorrect={false}
                 keyboardType="email-address"
+                textContentType="emailAddress"
+                autoComplete="email"
+                editable={!loading}
+                maxLength={254}
+                accessibilityLabel="Email"
               />
             </View>
           </View>
@@ -104,13 +200,22 @@ export default function AuthPage() {
                 placeholder="Enter your password"
                 secureTextEntry={!showPassword}
                 value={form.password}
-                onChangeText={(text) => setForm({ ...form, password: text })}
+                onChangeText={(text: string) => setForm((f) => ({ ...f, password: text }))}
                 className="flex-1 ml-3"
                 autoCapitalize="none"
+                autoCorrect={false}
+                textContentType="password"
+                autoComplete="password"
+                editable={!loading}
+                maxLength={128}
+                accessibilityLabel="Password"
+                returnKeyType="send"
+                onSubmitEditing={() => handleLogin()}
               />
               <TouchableOpacity
                 onPress={() => setShowPassword((prev) => !prev)}
                 hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                accessibilityLabel={showPassword ? "Hide password" : "Show password"}
               >
                 <Feather
                   name={showPassword ? "eye-off" : "eye"}
@@ -123,31 +228,46 @@ export default function AuthPage() {
 
           {/* LOGIN BUTTON */}
           <TouchableOpacity
-            onPress={handleLogin}
+            onPress={() => handleLogin()}
             disabled={loading}
-            className="bg-green-600 mt-4 mb-4 py-3 rounded-lg"
+            className="bg-green-600 mt-8 mb-4 py-3 rounded-lg flex-row items-center justify-center"
             style={{ opacity: loading ? 0.6 : 1 }}
+            accessibilityRole="button"
           >
+            {loading && <ActivityIndicator size="small" color="white" style={{ marginRight: 8 }} />}
             <Text className="text-white text-center font-medium">
               {loading ? "Logging in..." : "Login"}
             </Text>
           </TouchableOpacity>
 
-          <Text className="text-sm text-gray-500 text-center">
-            Forgot your password?{" "}
-            <Text className="text-green-600 font-medium">Reset here</Text>
-          </Text>
+
+          <TouchableOpacity onPress={() => setIsForgotPasswordOpen(true)} disabled={loading}>
+            <Text className="text-green-600 text-center mt-5 font-medium">Forgot Password?</Text>
+          </TouchableOpacity>
+
+          <View className="flex-row items-center my-4">
+            <View className="flex-1 h-px bg-gray-300" />
+            <Text className="mx-3 text-gray-500 font-medium">
+              OR
+            </Text>
+            <View className="flex-1 h-px bg-gray-300" />
+          </View>
 
           {/* REGISTER BUTTON */}
-          <TouchableOpacity onPress={() => setIsModalOpen(true)}>
-            <Text className="text-green-400 text-center font-medium mt-5">
-              Register Household
+          <TouchableOpacity onPress={() => setIsRegisterOpen(true)} disabled={loading}>
+            <Text className="text-green-600 text-center font-medium mt-1">
+              Register Household Account
             </Text>
           </TouchableOpacity>
 
           <RegisterHousehold
-            isOpen={isModalOpen}
-            onClose={() => setIsModalOpen(false)}
+            isOpen={isRegisterOpen}
+            onClose={() => setIsRegisterOpen(false)}
+          />
+
+          <ForgotPasswordModal
+            isOpen={isForgotPasswordOpen}
+            onClose={() => setIsForgotPasswordOpen(false)}
           />
 
         </View>
